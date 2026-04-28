@@ -8,7 +8,7 @@ import uuid
 
 st.set_page_config(
     page_title="Expense Split Tracker",
-    page_icon="💸  Hai",
+    page_icon="💸",
     layout="centered"
 )
 
@@ -111,7 +111,7 @@ def create_user():
 
 
 def login():
-    st.title("Expense Tracker")
+    st.title("Expense Tracker Hai")
 
     setup_database()
     users = read_tab("users")
