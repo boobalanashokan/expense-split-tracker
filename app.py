@@ -8,7 +8,7 @@ import uuid
 
 st.set_page_config(
     page_title="Expense Split Tracker",
-    page_icon="💸",
+    page_icon="💸  Hai",
     layout="centered"
 )
 
