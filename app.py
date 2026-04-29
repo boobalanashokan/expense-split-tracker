@@ -2,410 +2,657 @@ import streamlit as st
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
-from gspread.exceptions import WorksheetNotFound
 from datetime import datetime
 import uuid
+import random
+import string
 
 st.set_page_config(
-    page_title="Expense Split Tracker",
+    page_title="SplitSaathi",
     page_icon="💸",
     layout="centered"
 )
 
+# ── Styling ──────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:wght@300;400;500&display=swap');
+
+html, body, [class*="css"] {
+    font-family: 'DM Sans', sans-serif;
+}
+h1, h2, h3, .stMetricLabel, .stMetricValue {
+    font-family: 'Syne', sans-serif !important;
+}
+
+/* Hide default Streamlit header chrome */
+#MainMenu, footer, header { visibility: hidden; }
+
+.stApp {
+    background: #0f0f13;
+    color: #e8e4dc;
+}
+
+/* Sidebar */
+[data-testid="stSidebar"] {
+    background: #17171f !important;
+    border-right: 1px solid #2a2a38;
+}
+[data-testid="stSidebar"] .stRadio label {
+    color: #b0acaa !important;
+    font-size: 14px;
+}
+
+/* Buttons */
+.stButton > button {
+    background: #f0e040 !important;
+    color: #0f0f13 !important;
+    border: none !important;
+    border-radius: 4px !important;
+    font-family: 'Syne', sans-serif !important;
+    font-weight: 700 !important;
+    letter-spacing: 0.5px;
+    transition: opacity 0.2s;
+}
+.stButton > button:hover { opacity: 0.85 !important; }
+
+/* Inputs */
+.stTextInput input, .stNumberInput input, .stSelectbox div[data-baseweb="select"] {
+    background: #1e1e2a !important;
+    border: 1px solid #2e2e40 !important;
+    border-radius: 4px !important;
+    color: #e8e4dc !important;
+}
+
+/* Metrics */
+[data-testid="stMetricValue"] {
+    color: #f0e040 !important;
+    font-size: 2rem !important;
+}
+
+/* Tabs */
+.stTabs [data-baseweb="tab-list"] { background: #17171f; border-radius: 6px; }
+.stTabs [data-baseweb="tab"] { color: #888 !important; }
+.stTabs [aria-selected="true"] { color: #f0e040 !important; border-bottom: 2px solid #f0e040 !important; }
+
+/* Cards */
+.card {
+    background: #17171f;
+    border: 1px solid #2a2a38;
+    border-radius: 8px;
+    padding: 16px 20px;
+    margin: 8px 0;
+}
+.badge-green { color: #4ade80; font-weight: 600; }
+.badge-red   { color: #f87171; font-weight: 600; }
+.badge-gray  { color: #888;    font-weight: 600; }
+
+/* Group code display */
+.group-code {
+    background: #0f0f13;
+    border: 2px dashed #f0e040;
+    border-radius: 8px;
+    padding: 12px 20px;
+    font-family: 'Syne', monospace;
+    font-size: 2rem;
+    font-weight: 800;
+    letter-spacing: 6px;
+    color: #f0e040;
+    text-align: center;
+    margin: 12px 0;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# ── Constants ─────────────────────────────────────────────────────────────────
 SCOPE = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
 ]
 
-# Better: use Sheet ID instead of sheet name
 SHEET_ID = "10BMoKrsmSquiLh47IjMzcVL-NHJk7cdpAwmLgCyJZlQ"
 
 REQUIRED_TABS = {
-    "users": ["user_id", "name", "pin", "created_at"],
-    "expenses": ["expense_id", "date", "paid_by", "total_amount", "note", "created_at"],
-    "expense_items": ["item_id", "expense_id", "category", "item_name", "amount", "split_type", "visible_to", "friend_user_id"],
-    "settlements": ["settlement_id", "date", "from_user", "to_user", "amount", "note", "month_key"],
+    "users":         ["user_id", "name", "pin", "created_at"],
+    "groups":        ["group_id", "group_name", "invite_code", "created_by", "created_at"],
+    "group_members": ["member_id", "group_id", "user_id", "joined_at"],
+    "expenses":      ["expense_id", "group_id", "date", "paid_by", "total_amount", "note", "created_at"],
+    "expense_items": ["item_id", "expense_id", "group_id", "category", "item_name",
+                      "amount", "split_type", "split_with"],
+    "settlements":   ["settlement_id", "group_id", "date", "from_user", "to_user", "amount", "note"],
 }
 
+CATEGORIES = [
+    "🍳 Breakfast", "🍛 Lunch", "🍕 Dinner", "☕ Snacks",
+    "🛒 Groceries", "🏠 Household", "⛽ Petrol", "🏍️ Bike/Car",
+    "✈️ Travel", "🎁 Gift", "📺 Subscription", "💊 Medical", "🎉 Fun", "📦 Other"
+]
+
+# ── GSheets helpers ───────────────────────────────────────────────────────────
+@st.cache_resource
+def get_client():
+    creds = Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"], scopes=SCOPE
+    )
+    return gspread.authorize(creds)
 
 def get_sheet():
-    creds = Credentials.from_service_account_info(
-        st.secrets["gcp_service_account"],
-        scopes=SCOPE
-    )
-    client = gspread.authorize(creds)
-    return client.open_by_key(SHEET_ID)
-
+    return get_client().open_by_key(SHEET_ID)
 
 def setup_database():
     workbook = get_sheet()
     existing_tabs = [ws.title for ws in workbook.worksheets()]
-
     for tab_name, headers in REQUIRED_TABS.items():
         if tab_name not in existing_tabs:
-            ws = workbook.add_worksheet(title=tab_name, rows=1000, cols=len(headers))
+            ws = workbook.add_worksheet(title=tab_name, rows=2000, cols=len(headers))
             ws.append_row(headers)
         else:
             ws = workbook.worksheet(tab_name)
-            existing_headers = ws.row_values(1)
-
-            if not existing_headers:
+            if not ws.row_values(1):
                 ws.append_row(headers)
-            else:
-                missing_headers = [h for h in headers if h not in existing_headers]
-                if missing_headers:
-                    final_headers = existing_headers + missing_headers
-                    ws.update("1:1", [final_headers])
-
 
 def read_tab(tab_name):
-    setup_database()
-    sheet = get_sheet().worksheet(tab_name)
-    data = sheet.get_all_records()
-    return pd.DataFrame(data)
-
+    ws = get_sheet().worksheet(tab_name)
+    data = ws.get_all_records()
+    return pd.DataFrame(data) if data else pd.DataFrame(columns=REQUIRED_TABS[tab_name])
 
 def append_row(tab_name, row):
-    setup_database()
-    sheet = get_sheet().worksheet(tab_name)
-    sheet.append_row(row)
+    get_sheet().worksheet(tab_name).append_row(row)
 
+def gen_invite_code():
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
 
-def create_user():
-    st.subheader("Create User ID")
+# ── Auth ──────────────────────────────────────────────────────────────────────
+def login_page():
+    st.markdown("<h1 style='font-size:2.8rem; margin-bottom:0'>💸 SplitSaathi</h1>", unsafe_allow_html=True)
+    st.markdown("<p style='color:#888; margin-top:4px'>Track expenses. Split fairly. No drama.</p>", unsafe_allow_html=True)
+    st.markdown("---")
 
-    name = st.text_input("Your name")
-    pin = st.text_input("Create PIN", type="password")
-    confirm_pin = st.text_input("Confirm PIN", type="password")
-
-    if st.button("Create Account", use_container_width=True):
-        if not name.strip():
-            st.error("Enter your name.")
-            return
-
-        if not pin:
-            st.error("Enter a PIN.")
-            return
-
-        if pin != confirm_pin:
-            st.error("PIN and confirm PIN do not match.")
-            return
-
-        users = read_tab("users")
-
-        if not users.empty and name.strip().lower() in users["name"].astype(str).str.lower().tolist():
-            st.error("This name already exists. Use another name.")
-            return
-
-        user_id = "U_" + uuid.uuid4().hex[:6]
-        created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        append_row("users", [
-            user_id,
-            name.strip(),
-            pin,
-            created_at
-        ])
-
-        st.success(f"User created successfully. Your User ID: {user_id}")
-
-
-def login():
-    st.title("Expense Tracker Hai")
-
-    setup_database()
     users = read_tab("users")
-
-    tab1, tab2 = st.tabs(["Login", "Create User"])
+    tab1, tab2 = st.tabs(["Login", "Create Account"])
 
     with tab1:
         if users.empty:
-            st.info("No users found. Create your first user.")
+            st.info("No users yet. Create an account first.")
         else:
             name = st.selectbox("Who are you?", users["name"].tolist())
-            pin = st.text_input("PIN", type="password")
-
-            if st.button("Login", use_container_width=True):
+            pin  = st.text_input("PIN", type="password", key="login_pin")
+            if st.button("Login →", use_container_width=True):
                 user = users[
                     (users["name"].astype(str) == str(name)) &
-                    (users["pin"].astype(str) == str(pin))
+                    (users["pin"].astype(str)  == str(pin))
                 ]
-
                 if len(user) == 1:
                     st.session_state["user_id"] = user.iloc[0]["user_id"]
-                    st.session_state["name"] = user.iloc[0]["name"]
+                    st.session_state["name"]    = user.iloc[0]["name"]
                     st.rerun()
                 else:
-                    st.error("Wrong PIN")
+                    st.error("Wrong PIN.")
 
     with tab2:
-        create_user()
+        name = st.text_input("Your name", key="reg_name")
+        pin  = st.text_input("Create PIN", type="password", key="reg_pin")
+        pin2 = st.text_input("Confirm PIN", type="password", key="reg_pin2")
+        if st.button("Create Account", use_container_width=True, key="reg_btn"):
+            if not name.strip():
+                st.error("Enter a name.")
+            elif not pin:
+                st.error("Enter a PIN.")
+            elif pin != pin2:
+                st.error("PINs don't match.")
+            elif not users.empty and name.strip().lower() in users["name"].str.lower().tolist():
+                st.error("Name already taken.")
+            else:
+                uid = "U_" + uuid.uuid4().hex[:6]
+                append_row("users", [uid, name.strip(), pin, datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
+                st.success(f"Account created! Login now.")
 
+# ── Group management ───────────────────────────────────────────────────────────
+def group_page():
+    st.markdown("<h2>Groups</h2>", unsafe_allow_html=True)
+    uid = st.session_state["user_id"]
 
+    groups   = read_tab("groups")
+    members  = read_tab("group_members")
+    users    = read_tab("users")
+
+    # Groups this user belongs to
+    my_gids = members[members["user_id"] == uid]["group_id"].tolist() if not members.empty else []
+    my_groups = groups[groups["group_id"].isin(my_gids)] if not groups.empty else pd.DataFrame()
+
+    if not my_groups.empty:
+        st.markdown("### Your Groups")
+        for _, g in my_groups.iterrows():
+            gid = g["group_id"]
+            gname = g["group_name"]
+            code  = g["invite_code"]
+            gmems = members[members["group_id"] == gid]["user_id"].tolist() if not members.empty else []
+            mem_names = users[users["user_id"].isin(gmems)]["name"].tolist()
+
+            st.markdown(f"""
+            <div class="card">
+                <div style="font-family:Syne;font-size:1.1rem;font-weight:700">{gname}</div>
+                <div style="color:#888;font-size:13px">👥 {', '.join(mem_names)}</div>
+            </div>""", unsafe_allow_html=True)
+
+            if st.button(f"Open → {gname}", key=f"open_{gid}"):
+                st.session_state["group_id"]   = gid
+                st.session_state["group_name"] = gname
+                st.rerun()
+
+            with st.expander(f"Invite code for {gname}"):
+                st.markdown(f'<div class="group-code">{code}</div>', unsafe_allow_html=True)
+                st.caption("Share this code with friends to let them join.")
+
+        st.markdown("---")
+
+    tab1, tab2 = st.tabs(["Create Group", "Join Group"])
+
+    with tab1:
+        gname = st.text_input("Group name (e.g. Goa Trip, Home)")
+        if st.button("Create Group", use_container_width=True):
+            if not gname.strip():
+                st.error("Enter a group name.")
+            else:
+                gid   = "G_" + uuid.uuid4().hex[:6]
+                code  = gen_invite_code()
+                now   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                append_row("groups",        [gid, gname.strip(), code, uid, now])
+                append_row("group_members", ["M_" + uuid.uuid4().hex[:6], gid, uid, now])
+                st.success(f"Group '{gname}' created!")
+                st.markdown(f'<div class="group-code">{code}</div>', unsafe_allow_html=True)
+                st.caption("Share this invite code with your friends.")
+                st.rerun()
+
+    with tab2:
+        code = st.text_input("Enter invite code", placeholder="ABC123").strip().upper()
+        if st.button("Join Group", use_container_width=True):
+            if not code:
+                st.error("Enter a code.")
+            elif groups.empty or code not in groups["invite_code"].tolist():
+                st.error("Invalid invite code.")
+            else:
+                target = groups[groups["invite_code"] == code].iloc[0]
+                gid    = target["group_id"]
+                already = members[(members["group_id"] == gid) & (members["user_id"] == uid)]
+                if not already.empty:
+                    st.info("You're already in this group.")
+                else:
+                    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    append_row("group_members", ["M_" + uuid.uuid4().hex[:6], gid, uid, now])
+                    st.success(f"Joined '{target['group_name']}'!")
+                    st.rerun()
+
+# ── Add Expense ───────────────────────────────────────────────────────────────
 def add_expense():
-    st.header("Add Expense")
+    st.markdown("<h2>Add Expense</h2>", unsafe_allow_html=True)
 
-    users = read_tab("users")
+    gid      = st.session_state["group_id"]
+    uid      = st.session_state["user_id"]
+    members  = read_tab("group_members")
+    users    = read_tab("users")
 
-    if len(users) < 2:
-        st.warning("Create at least 2 users to use split features.")
+    group_uids  = members[members["group_id"] == gid]["user_id"].tolist()
+    group_users = users[users["user_id"].isin(group_uids)]
 
-    current_user = st.session_state["user_id"]
-    friend_options = users[users["user_id"] != current_user]
+    if group_users.empty:
+        st.warning("No members in this group yet.")
+        return
 
-    paid_by_name = st.selectbox("Paid by", users["name"].tolist())
-    paid_by = users[users["name"] == paid_by_name].iloc[0]["user_id"]
+    paid_by_name = st.selectbox("Paid by", group_users["name"].tolist())
+    paid_by      = group_users[group_users["name"] == paid_by_name].iloc[0]["user_id"]
+    total_amount = st.number_input("Total amount paid (₹)", min_value=0.0, step=10.0)
+    note         = st.text_input("Bill note (optional)", placeholder="Dinner at Haldiram's")
 
-    total_amount = st.number_input("Total paid amount", min_value=0.0, step=10.0)
-    note = st.text_input("Bill note")
-
-    st.subheader("Items")
-
-    item_count = st.number_input("Number of items", min_value=1, max_value=10, value=3)
+    st.markdown("---")
+    st.markdown("### Items")
+    item_count = st.number_input("Number of items", min_value=1, max_value=20, value=2)
 
     items = []
+    total_entered = 0.0
 
-    for i in range(item_count):
-        st.markdown(f"### Item {i + 1}")
+    other_users = group_users[group_users["user_id"] != uid]
 
-        category = st.selectbox(
-            "Category",
-            ["Breakfast", "Lunch", "Snacks", "Groceries", "Household", "Petrol", "Bike Wash", "Travel", "Gift", "Subscription", "Other"],
-            key=f"cat_{i}"
-        )
+    for i in range(int(item_count)):
+        with st.expander(f"Item {i+1}", expanded=True):
+            category  = st.selectbox("Category",  CATEGORIES, key=f"cat_{i}")
+            item_name = st.text_input("Item name", key=f"iname_{i}")
+            amount    = st.number_input("Amount (₹)", min_value=0.0, step=1.0, key=f"amt_{i}")
+            total_entered += amount
 
-        item_name = st.text_input("Item name", key=f"name_{i}")
-        amount = st.number_input("Amount", min_value=0.0, step=10.0, key=f"amt_{i}")
+            split_options = ["Only me"]
+            if not other_users.empty:
+                split_options += ["Shared equally (all)", "Split with specific people", "Only specific person pays"]
 
-        split_type = st.selectbox(
-            "Who is this for?",
-            ["Only me", "Only friend", "Shared equally"],
-            key=f"split_{i}"
-        )
+            split_type = st.selectbox("Split type", split_options, key=f"split_{i}")
 
-        friend_id = ""
-        visible_to = current_user
+            split_with = []  # list of user_ids this is split among
 
-        if split_type in ["Only friend", "Shared equally"]:
-            if friend_options.empty:
-                st.error("No friend user available. Create another user first.")
-                return
+            if split_type == "Only me":
+                split_with = [uid]
 
-            friend_name = st.selectbox(
-                "Friend",
-                friend_options["name"].tolist(),
-                key=f"friend_{i}"
-            )
-            friend_id = friend_options[friend_options["name"] == friend_name].iloc[0]["user_id"]
-            visible_to = f"{current_user},{friend_id}"
+            elif split_type == "Shared equally (all)":
+                split_with = group_uids  # everyone
 
-        split_map = {
-            "Only me": "private_me",
-            "Only friend": "private_friend",
-            "Shared equally": "shared_equal"
-        }
+            elif split_type == "Split with specific people":
+                chosen_names = st.multiselect(
+                    "Split with (select people, you're included automatically)",
+                    other_users["name"].tolist(), key=f"msel_{i}"
+                )
+                chosen_ids = other_users[other_users["name"].isin(chosen_names)]["user_id"].tolist()
+                split_with = [uid] + chosen_ids  # always include self
 
-        items.append([
-            category,
-            item_name,
-            amount,
-            split_map[split_type],
-            visible_to,
-            friend_id
-        ])
+            elif split_type == "Only specific person pays":
+                chosen_name = st.selectbox("Who pays for this?", group_users["name"].tolist(), key=f"solo_{i}")
+                chosen_id   = group_users[group_users["name"] == chosen_name].iloc[0]["user_id"]
+                split_with  = [chosen_id]
 
-    entered_total = sum(x[2] for x in items)
-    st.info(f"Items total: ₹{entered_total:.2f}")
+            items.append({
+                "category":   category,
+                "item_name":  item_name,
+                "amount":     amount,
+                "split_type": split_type,
+                "split_with": ",".join(split_with),
+            })
 
-    if st.button("Save Expense", use_container_width=True):
-        if round(entered_total, 2) != round(total_amount, 2):
-            st.error("Total amount and item total are not matching.")
+    st.markdown(f"**Items total: ₹{total_entered:.2f}**")
+
+    if st.button("💾 Save Expense", use_container_width=True):
+        if round(total_entered, 2) != round(total_amount, 2):
+            st.error(f"Item total ₹{total_entered:.2f} ≠ Total paid ₹{total_amount:.2f}. Please fix.")
             return
 
         expense_id = "E_" + uuid.uuid4().hex[:8]
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        today = datetime.now().strftime("%Y-%m-%d")
+        now        = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        today      = datetime.now().strftime("%Y-%m-%d")
 
-        append_row("expenses", [
-            expense_id,
-            today,
-            paid_by,
-            total_amount,
-            note,
-            now
-        ])
+        append_row("expenses", [expense_id, gid, today, paid_by, total_amount, note, now])
 
         for item in items:
             item_id = "I_" + uuid.uuid4().hex[:8]
             append_row("expense_items", [
-                item_id,
-                expense_id,
-                item[0],
-                item[1],
-                item[2],
-                item[3],
-                item[4],
-                item[5]
+                item_id, expense_id, gid,
+                item["category"], item["item_name"], item["amount"],
+                item["split_type"], item["split_with"]
             ])
 
-        st.success("Expense saved")
+        st.success("✅ Expense saved!")
 
-
+# ── Balances ──────────────────────────────────────────────────────────────────
 def balances():
-    st.header("Balances")
+    st.markdown("<h2>Balances</h2>", unsafe_allow_html=True)
 
-    current_user = st.session_state["user_id"]
+    gid   = st.session_state["group_id"]
+    uid   = st.session_state["user_id"]
+    users = read_tab("users")
+    members = read_tab("group_members")
 
-    expenses = read_tab("expenses")
-    items = read_tab("expense_items")
-    settlements = read_tab("settlements")
+    group_uids  = members[members["group_id"] == gid]["user_id"].tolist()
+
+    expenses   = read_tab("expenses")
+    items      = read_tab("expense_items")
+    settlements= read_tab("settlements")
+
+    # Filter to this group only
+    if expenses.empty or items.empty:
+        st.info("No expenses in this group yet.")
+        return
+
+    grp_expenses = expenses[expenses["group_id"] == gid]
+    if grp_expenses.empty:
+        st.info("No expenses in this group yet.")
+        return
+
+    grp_items = items[items["group_id"] == gid]
+
+    # net[a][b] = amount b owes a
+    net = {}  # net[creditor][debtor] = amount
+
+    def add_debt(creditor, debtor, amount):
+        if creditor == debtor or amount == 0:
+            return
+        if creditor not in net:
+            net[creditor] = {}
+        net[creditor][debtor] = net[creditor].get(debtor, 0) + amount
+
+    for _, exp in grp_expenses.iterrows():
+        paid_by  = exp["paid_by"]
+        eid      = exp["expense_id"]
+        exp_items= grp_items[grp_items["expense_id"] == eid]
+
+        for _, row in exp_items.iterrows():
+            amount     = float(row["amount"])
+            split_with = [s.strip() for s in str(row["split_with"]).split(",") if s.strip()]
+
+            if not split_with:
+                continue
+
+            per_person = amount / len(split_with)
+
+            for person in split_with:
+                if person != paid_by:
+                    add_debt(paid_by, person, per_person)
+
+    # Apply settlements
+    if not settlements.empty:
+        grp_settlements = settlements[settlements["group_id"] == gid]
+        for _, row in grp_settlements.iterrows():
+            from_user = row["from_user"]
+            to_user   = row["to_user"]
+            amount    = float(row["amount"])
+            # from_user paid to_user → reduces to_user's debt to from_user
+            if to_user in net and from_user in net[to_user]:
+                net[to_user][from_user] = max(0, net[to_user].get(from_user, 0) - amount)
+
+    def user_name(uid_):
+        r = users[users["user_id"] == uid_]
+        return r.iloc[0]["name"] if not r.empty else uid_
+
+    # Show balances relevant to current user
+    found = False
+    for creditor, debtors in net.items():
+        for debtor, amount in debtors.items():
+            if amount < 0.01:
+                continue
+            if creditor == uid:
+                found = True
+                st.markdown(f"""
+                <div class="card">
+                    <span class="badge-green">↑ {user_name(debtor)} owes you ₹{amount:.2f}</span>
+                </div>""", unsafe_allow_html=True)
+            elif debtor == uid:
+                found = True
+                st.markdown(f"""
+                <div class="card">
+                    <span class="badge-red">↓ You owe {user_name(creditor)} ₹{amount:.2f}</span>
+                </div>""", unsafe_allow_html=True)
+
+    if not found:
+        st.markdown('<div class="card"><span class="badge-gray">✓ All settled up!</span></div>', unsafe_allow_html=True)
+
+    # Group-wide summary
+    st.markdown("---")
+    st.markdown("### Group Overview")
+    for creditor, debtors in net.items():
+        for debtor, amount in debtors.items():
+            if amount < 0.01:
+                continue
+            st.markdown(f"<div class='card' style='font-size:13px;color:#999'>"
+                        f"{user_name(debtor)} → {user_name(creditor)}: "
+                        f"<b style='color:#e8e4dc'>₹{amount:.2f}</b></div>",
+                        unsafe_allow_html=True)
+
+# ── Settle Up ─────────────────────────────────────────────────────────────────
+def settle_up():
+    st.markdown("<h2>Settle Up</h2>", unsafe_allow_html=True)
+
+    gid     = st.session_state["group_id"]
+    members = read_tab("group_members")
+    users   = read_tab("users")
+
+    group_uids  = members[members["group_id"] == gid]["user_id"].tolist()
+    group_users = users[users["user_id"].isin(group_uids)]
+
+    if len(group_users) < 2:
+        st.warning("Need at least 2 members to settle.")
+        return
+
+    from_name = st.selectbox("Who paid?",      group_users["name"].tolist(), key="s_from")
+    to_name   = st.selectbox("Who received?",  group_users["name"].tolist(), key="s_to")
+    amount    = st.number_input("Amount (₹)",  min_value=0.0, step=10.0)
+    note      = st.text_input("Note (optional)", placeholder="GPay / Cash")
+
+    if st.button("Save Settlement", use_container_width=True):
+        from_uid = group_users[group_users["name"] == from_name].iloc[0]["user_id"]
+        to_uid   = group_users[group_users["name"] == to_name].iloc[0]["user_id"]
+
+        if from_uid == to_uid:
+            st.error("Payer and receiver can't be the same.")
+            return
+
+        sid   = "S_" + uuid.uuid4().hex[:8]
+        today = datetime.now().strftime("%Y-%m-%d")
+        append_row("settlements", [sid, gid, today, from_uid, to_uid, amount, note])
+        st.success("Settlement recorded!")
+
+# ── Expense History ────────────────────────────────────────────────────────────
+def history():
+    st.markdown("<h2>Expense History</h2>", unsafe_allow_html=True)
+
+    gid   = st.session_state["group_id"]
     users = read_tab("users")
 
-    if expenses.empty or items.empty:
+    expenses = read_tab("expenses")
+    items    = read_tab("expense_items")
+
+    if expenses.empty:
         st.info("No expenses yet.")
         return
 
-    df = items.merge(expenses, on="expense_id", how="left")
-    balance = {}
+    grp_exp = expenses[expenses["group_id"] == gid].sort_values("date", ascending=False)
 
-    for _, row in df.iterrows():
-        paid_by = row["paid_by"]
-        amount = float(row["amount"])
-        split_type = row["split_type"]
-        friend = row["friend_user_id"]
-
-        if split_type == "private_friend":
-            if friend and paid_by == current_user:
-                balance[friend] = balance.get(friend, 0) + amount
-
-        elif split_type == "shared_equal":
-            if friend:
-                friend_share = amount / 2
-
-                if paid_by == current_user:
-                    balance[friend] = balance.get(friend, 0) + friend_share
-                elif paid_by == friend:
-                    balance[friend] = balance.get(friend, 0) - friend_share
-
-    if not settlements.empty:
-        for _, row in settlements.iterrows():
-            from_user = row["from_user"]
-            to_user = row["to_user"]
-            amount = float(row["amount"])
-
-            if to_user == current_user:
-                balance[from_user] = balance.get(from_user, 0) - amount
-            elif from_user == current_user:
-                balance[to_user] = balance.get(to_user, 0) + amount
-
-    if not balance:
-        st.info("No pending balances.")
+    if grp_exp.empty:
+        st.info("No expenses in this group yet.")
         return
 
-    for friend_id, amt in balance.items():
-        friend_row = users[users["user_id"] == friend_id]
+    def uname(uid_):
+        r = users[users["user_id"] == uid_]
+        return r.iloc[0]["name"] if not r.empty else uid_
 
-        if friend_row.empty:
-            friend_name = friend_id
-        else:
-            friend_name = friend_row.iloc[0]["name"]
+    for _, exp in grp_exp.iterrows():
+        eid       = exp["expense_id"]
+        paid_by   = uname(exp["paid_by"])
+        exp_items = items[items["expense_id"] == eid] if not items.empty else pd.DataFrame()
 
-        if amt > 0:
-            st.success(f"{friend_name} owes you ₹{amt:.2f}")
-        elif amt < 0:
-            st.warning(f"You owe {friend_name} ₹{abs(amt):.2f}")
-        else:
-            st.info(f"Settled with {friend_name}")
+        with st.expander(f"📋 {exp['date']}  |  {exp['note'] or 'Expense'}  |  ₹{float(exp['total_amount']):.2f}  (paid by {paid_by})"):
+            if exp_items.empty:
+                st.write("No items found.")
+            else:
+                for _, it in exp_items.iterrows():
+                    sw = [uname(x.strip()) for x in str(it["split_with"]).split(",") if x.strip()]
+                    st.markdown(
+                        f"**{it['item_name'] or '—'}** ({it['category']})  "
+                        f"₹{float(it['amount']):.2f}  "
+                        f"— split: {', '.join(sw)}"
+                    )
 
-
-def settle_up():
-    st.header("Settle Up")
-
-    users = read_tab("users")
-    current_user = st.session_state["user_id"]
-
-    if len(users) < 2:
-        st.warning("Create at least 2 users first.")
-        return
-
-    from_name = st.selectbox("Who paid settlement?", users["name"].tolist())
-    to_name = st.selectbox("Who received?", users["name"].tolist())
-
-    from_user = users[users["name"] == from_name].iloc[0]["user_id"]
-    to_user = users[users["name"] == to_name].iloc[0]["user_id"]
-
-    amount = st.number_input("Settlement amount", min_value=0.0, step=10.0)
-    note = st.text_input("Settlement note", placeholder="GPay / cash / monthly close")
-
-    if st.button("Save Settlement", use_container_width=True):
-        if from_user == to_user:
-            st.error("Settlement payer and receiver cannot be same.")
-            return
-
-        settlement_id = "S_" + uuid.uuid4().hex[:8]
-        today = datetime.now().strftime("%Y-%m-%d")
-        month_key = datetime.now().strftime("%Y-%m")
-
-        append_row("settlements", [
-            settlement_id,
-            today,
-            from_user,
-            to_user,
-            amount,
-            note,
-            month_key
-        ])
-
-        st.success("Settlement saved")
-
-
+# ── Dashboard ─────────────────────────────────────────────────────────────────
 def dashboard():
-    st.header("My Dashboard")
+    st.markdown("<h2>Dashboard</h2>", unsafe_allow_html=True)
 
-    current_user = st.session_state["user_id"]
+    gid   = st.session_state["group_id"]
+    uid   = st.session_state["user_id"]
+    users = read_tab("users")
+
     expenses = read_tab("expenses")
-    items = read_tab("expense_items")
+    items    = read_tab("expense_items")
 
     if expenses.empty or items.empty:
         st.info("No data yet.")
         return
 
-    df = items.merge(expenses, on="expense_id", how="left")
-    df["amount"] = df["amount"].astype(float)
+    grp_exp   = expenses[expenses["group_id"] == gid]
+    grp_items = items[items["group_id"] == gid]
 
-    visible_df = df[df["visible_to"].astype(str).str.contains(current_user, na=False)]
-
-    st.metric("Visible tracked amount", f"₹{visible_df['amount'].sum():.2f}")
-
-    cat = visible_df.groupby("category")["amount"].sum().reset_index()
-
-    if not cat.empty:
-        st.bar_chart(cat, x="category", y="amount")
-
-
-def main():
-    setup_database()
-
-    if "user_id" not in st.session_state:
-        login()
+    if grp_exp.empty:
+        st.info("No data yet.")
         return
 
-    st.sidebar.success(f"Logged in as {st.session_state['name']}")
+    total_group = grp_exp["total_amount"].astype(float).sum()
+    members     = read_tab("group_members")
+    mem_count   = len(members[members["group_id"] == gid])
 
-    page = st.sidebar.radio(
-        "Menu",
-        ["Add Expense", "Balances", "Settle Up", "Dashboard"]
-    )
+    # My share items
+    my_items = grp_items[grp_items["split_with"].astype(str).str.contains(uid, na=False)]
+    my_share = 0.0
+    for _, row in my_items.iterrows():
+        sw = [s.strip() for s in str(row["split_with"]).split(",") if s.strip()]
+        my_share += float(row["amount"]) / max(len(sw), 1)
 
-    if page == "Add Expense":
-        add_expense()
-    elif page == "Balances":
-        balances()
-    elif page == "Settle Up":
-        settle_up()
-    elif page == "Dashboard":
-        dashboard()
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Group Total",  f"₹{total_group:.0f}")
+    c2.metric("Your Share",   f"₹{my_share:.0f}")
+    c3.metric("Members",      mem_count)
 
+    st.markdown("---")
+    st.markdown("### Spending by Category")
+
+    if not grp_items.empty:
+        grp_items = grp_items.copy()
+        grp_items["amount"] = grp_items["amount"].astype(float)
+        cat = grp_items.groupby("category")["amount"].sum().reset_index()
+        cat = cat.sort_values("amount", ascending=False)
+        st.bar_chart(cat.set_index("category")["amount"])
+
+    st.markdown("### My Category Breakdown")
+    if not my_items.empty:
+        my_items = my_items.copy()
+        my_items["my_share"] = my_items.apply(
+            lambda r: float(r["amount"]) / max(len([s for s in str(r["split_with"]).split(",") if s.strip()]), 1), axis=1
+        )
+        cat2 = my_items.groupby("category")["my_share"].sum().reset_index()
+        st.bar_chart(cat2.set_index("category")["my_share"])
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+def main():
+    if "db_ready" not in st.session_state:
+        setup_database()
+        st.session_state["db_ready"] = True
+
+    # Not logged in
+    if "user_id" not in st.session_state:
+        login_page()
+        return
+
+    # Logged in but no group selected
+    if "group_id" not in st.session_state:
+        st.sidebar.markdown(f"**👤 {st.session_state['name']}**")
+        if st.sidebar.button("Logout"):
+            st.session_state.clear()
+            st.rerun()
+        group_page()
+        return
+
+    # Logged in + group selected
+    gname = st.session_state.get("group_name", "Group")
+    st.sidebar.markdown(f"**👤 {st.session_state['name']}**")
+    st.sidebar.markdown(f"<div style='color:#f0e040;font-size:13px;margin-bottom:8px'>📁 {gname}</div>",
+                        unsafe_allow_html=True)
+
+    if st.sidebar.button("⬅ Switch Group"):
+        del st.session_state["group_id"]
+        del st.session_state["group_name"]
+        st.rerun()
+
+    page = st.sidebar.radio("Menu", ["Add Expense", "Balances", "Settle Up", "History", "Dashboard"])
+
+    if page == "Add Expense": add_expense()
+    elif page == "Balances":  balances()
+    elif page == "Settle Up": settle_up()
+    elif page == "History":   history()
+    elif page == "Dashboard": dashboard()
+
+    st.sidebar.markdown("---")
     if st.sidebar.button("Logout"):
         st.session_state.clear()
         st.rerun()
